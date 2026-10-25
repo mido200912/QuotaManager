@@ -587,6 +587,17 @@ class WafConfig:
 
 
 @dataclass
+class RouterConfig:
+    """Home router integration (Huawei HG630 V2 / ZTE) for block sync and stats."""
+    enabled: bool = False
+    ip: str = "192.168.1.1"
+    username: str = "admin"
+    password: str = ""
+    poll_interval: float = 15.0
+    sync_blocks: bool = True
+
+
+@dataclass
 class Config:
     db_path: str = "data/quota.db"
     log_file: str = "logs/quota.log"
@@ -604,6 +615,7 @@ class Config:
     updates: UpdateConfig = field(default_factory=UpdateConfig)
     firewall: FirewallConfig = field(default_factory=FirewallConfig)
     waf: WafConfig = field(default_factory=WafConfig)
+    router: RouterConfig = field(default_factory=RouterConfig)
     timezone: str = ""  # empty => system local timezone
 
 

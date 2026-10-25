@@ -4,6 +4,7 @@ import { api } from "../core/api.js";
 import { sw, chip } from "../components/ui.js";
 import { toast } from "../components/toast.js";
 import wanCard from "./internetWan.js";
+import routerDslCard from "./routerDslCard.js";
 
 const x = { v6: null, ts: null, loading: false, at: 0, failAt: 0 };
 let draft = null, armedRenew = false, armedOut = false, busy = false;
@@ -121,5 +122,6 @@ export default function internet(ctx) {
         h("div", { class: "fa", style: { "margin-top": "14px" } }, h("button", { type: "button", class: "btn ghost sm", onclick: probe }, t("i.v6.probe")))]
         : h("div", { class: "skeleton", style: { height: "140px" } })),
     tailscaleCard(ts, run, ctx),
-    wanCard(ctx)));
+    wanCard(ctx),
+    ...routerDslCard(ctx)));
 }

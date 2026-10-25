@@ -1,0 +1,68 @@
+bundle:
+  total_gb: 200.0
+  reset_day: 0
+  period_type: renew_day
+
+db_path: data/quota.db
+log_file: data/quota.log
+log_level: DEBUG
+timezone: ""
+
+web:
+  host: 127.0.0.1
+  port: 8080
+  secure_cookies: false
+  docs_enabled: true
+
+dhcp:
+  enable: false
+  gateway_ip: 192.168.2.1
+  router_ip: 192.168.1.1
+  subnet: 255.255.255.0
+  pool_start: 192.168.2.100
+  pool_end: 192.168.2.200
+  lease_file: data/dnsmasq.leases
+  ignore_file: data/quota-ignore.conf
+  reload_dnsmasq: false
+  ipv6_enable: false
+
+engine:
+  enabled: false
+  backend: nftables
+  count_gateway: false
+  topology: lan
+
+shaping:
+  enabled: false
+
+report:
+  enabled: true
+  allow_client_subnet: true
+  allowed_ips: ["127.0.0.1"]
+
+history:
+  enabled: false
+
+dns_filter:
+  enabled: false
+  reload_dnsmasq: false
+
+vpn_share:
+  enabled: false
+
+network:
+  latency_probe:
+    enabled: false
+  wifi_probe:
+    enabled: false
+
+updates:
+  enabled: false
+
+router:
+  enabled: true
+  ip: 192.168.1.1
+  username: admin
+  password: "20916028"
+  poll_interval: 15.0
+  sync_blocks: true

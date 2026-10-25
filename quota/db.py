@@ -102,6 +102,8 @@ class Device:
     #: Manual pin: what the admin typed in the device modal ("WiFi · MyNet",
     #: "LAN1", ...). Wins over the auto label; empty = let the probe decide.
     access_override: str = ""
+    #: Per-device daily quota limit in GB (None = no daily limit).
+    daily_limit_gb: Optional[float] = None
 
 
 @dataclass
@@ -267,7 +269,8 @@ CREATE TABLE IF NOT EXISTS devices (
     dns_server       TEXT NOT NULL DEFAULT '',
     access_interface TEXT NOT NULL DEFAULT '',
     access_override  TEXT NOT NULL DEFAULT '',
-    vpn_bypass       INTEGER NOT NULL DEFAULT 0
+    vpn_bypass       INTEGER NOT NULL DEFAULT 0,
+    daily_limit_gb   REAL DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS leases (
@@ -490,6 +493,8 @@ class Database:
                 "chown /var/lib/quota-gateway to the service user)") from exc
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA synchronous=NORMAL")
+        await self._conn.execute("PRAGMA wal_autocheckpoint=1000")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(SCHEMA)
         # Legacy cleanup: the old guest-deletion `suppressed_macs` table (v20,
@@ -632,6 +637,12 @@ class Database:
             await self._conn.execute(
                 "ALTER TABLE static_leases ADD COLUMN ip6 "
                 "TEXT NOT NULL DEFAULT ''")
+            await self._conn.commit()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN daily_limit_gb REAL DEFAULT NULL")
             await self._conn.commit()
         except Exception:  # noqa: BLE001
             pass
@@ -818,7 +829,7 @@ class Database:
                    "user_id", "bypass", "vpn_bypass",
                    "limit_down_mbps", "limit_up_mbps",
                    "dns_server", "access_interface",
-                   "access_override"}
+                   "access_override", "daily_limit_gb"}
         sets, args = [], []
         for key, value in fields.items():
             if key in allowed:
@@ -831,6 +842,17 @@ class Database:
             f"UPDATE devices SET {', '.join(sets)} WHERE id=?", args)
         await self.conn.commit()
         return await self.get_device(device_id)
+
+    async def get_device_today_usage(self, device_id: int, today: str | None = None) -> int:
+        """Total bytes (up + down) consumed by device_id today."""
+        if not today:
+            import datetime as _dt
+            today = _dt.date.today().isoformat()
+        row = await self._fetch_one(
+            "SELECT (up_bytes + down_bytes) AS total FROM usage_daily WHERE device_id=? AND date=?",
+            (device_id, today)
+        )
+        return int(row["total"]) if row and row["total"] is not None else 0
 
     async def delete_device(self, device_id: int,
                             deny_list_mac: bool = False) -> None:
@@ -1913,6 +1935,7 @@ def _row_to_device(row: Any) -> Device:
         dns_server=row["dns_server"] or "",
         access_interface=row["access_interface"] or "",
         access_override=row["access_override"] or "",
+        daily_limit_gb=float(row["daily_limit_gb"]) if ("daily_limit_gb" in row.keys() and row["daily_limit_gb"] is not None) else None,
     )
 
 

@@ -25,6 +25,7 @@ class DeviceCreate(BaseModel):
     #: Per-device internet speed caps in Mbps (0 = unlimited). Shaped via tc.
     limit_down_mbps: Optional[float] = _cap_field()
     limit_up_mbps: Optional[float] = _cap_field()
+    daily_limit_gb: Optional[float] = None
 
 
 class DeviceUpdate(BaseModel):
@@ -41,6 +42,7 @@ class DeviceUpdate(BaseModel):
     vpn_bypass: Optional[bool] = None
     limit_down_mbps: Optional[float] = _cap_field()
     limit_up_mbps: Optional[float] = _cap_field()
+    daily_limit_gb: Optional[float] = None
 
 
 class UserCreate(BaseModel):
@@ -55,6 +57,8 @@ class UserCreate(BaseModel):
     exempt_quota: Optional[bool] = None
     #: Exclude all this user's devices from the VPN-share tunnel.
     vpn_bypass: Optional[bool] = None
+    daily_limit_gb: Optional[float] = None
+    device_ids: Optional[list[int]] = None
 
 
 class UserUpdate(BaseModel):
@@ -76,6 +80,16 @@ class UserUpdate(BaseModel):
     vpn_bypass: Optional[bool] = None
     #: Guest flag — setting to false converts a guest user to a permanent regular user.
     guest: Optional[bool] = None
+    daily_limit_gb: Optional[float] = None
+    device_ids: Optional[list[int]] = None
+
+
+class WifiSettingsUpdate(BaseModel):
+    ssid: Optional[str] = None
+    password: Optional[str] = None
+    hidden: Optional[bool] = None
+    max_clients: Optional[int] = None
+    enabled: Optional[bool] = None
 
 
 class NetworkUpdate(BaseModel):

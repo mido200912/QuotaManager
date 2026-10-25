@@ -18,4 +18,9 @@ export const actions = {
   createDevice: (body) => api.post("/api/devices", body),
   topupUser: (id, extra_gb) => api.post(`/api/users/${id}/topup`, { extra_gb }),
   topupDevice: (id, extra_gb) => api.post(`/api/devices/${id}/topup`, { extra_gb }),
+  getRouterDsl: () => api.get("/api/router/dsl"),
+  getRouterInfo: () => api.get("/api/router/info"),
+  getRouterWifi: () => api.get("/api/router/wifi"),
+  updateRouterWifi: (body) => api.post("/api/router/wifi", body),
+  rebootRouter: () => api.post("/api/router/reboot"),
 };

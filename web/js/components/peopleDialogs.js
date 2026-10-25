@@ -15,18 +15,59 @@ function quotaFields() {
   return { mode, gb, nodes: [f(t("dr.quota"), mode), wrap] };
 }
 
-export function openAddUser(refresh) {
+export function openAddUser(usersOrRefresh, maybeRefresh) {
+  const users = Array.isArray(usersOrRefresh) ? usersOrRefresh : [];
+  const refresh = typeof usersOrRefresh === "function" ? usersOrRefresh : maybeRefresh;
   const name = h("input", { class: "input", required: true, placeholder: t("add.user.name.ph") });
   const q = quotaFields(), down = numIn(), up = numIn();
+  const daily = numIn();
   const exempt = h("input", { type: "checkbox" }), vpn = h("input", { type: "checkbox" });
   const chk = (el, l) => h("label", { class: "chk" }, el, h("span", {}, l));
-  openDialog({ title: t("add.user"), sub: t("add.user.sub"), submitLabel: t("add.submit"),
-    content: [f(t("add.user.name"), name), ...q.nodes, h("div", { class: "form-row" }, f(t("dr.limit.down"), down), f(t("dr.limit.up"), up), ), h("span", { class: "sub" }, t("dr.limit.hint")), chk(exempt, t("dr.unlimited")), chk(vpn, t("dr.vpnbypass"))],
+
+  // Multi-device selection checklist for grouping devices together
+  const allDevices = users.flatMap((u) => (u.devices || []).filter((d) => !d.gateway));
+  const devChecks = allDevices.map((d) => {
+    const cb = h("input", { type: "checkbox", value: String(d.id) });
+    return h("label", { class: "chk", style: { display: "flex", "align-items": "center", gap: "8px", padding: "4px 0" } },
+      cb, h("span", { style: { "font-size": "13px" } }, `${d.name || d.mac} `, h("small", { class: "sub mono" }, `(${d.ip || d.mac})`)));
+  });
+  const devListWrap = allDevices.length ? h("div", { class: "field" },
+    h("label", {}, t("add.user.group_devs") || "ضم أجهزة لهذه المجموعة"),
+    h("div", { style: { "max-height": "140px", "overflow-y": "auto", padding: "6px 10px", border: "1px solid var(--border)", "border-radius": "8px", background: "rgba(0,0,0,0.15)" } }, devChecks),
+    h("span", { class: "sub" }, t("add.user.group_devs.hint") || "الأجهزة المختارة ستشترك في نفس الباقة الشهرية والحد اليومي")
+  ) : null;
+
+  openDialog({
+    title: t("add.user"), sub: t("add.user.sub"), submitLabel: t("add.submit"),
+    content: [
+      f(t("add.user.name"), name),
+      ...q.nodes,
+      f(t("dr.daily_limit"), daily, t("dr.daily_limit.hint")),
+      devListWrap,
+      h("div", { class: "form-row" }, f(t("dr.limit.down"), down), f(t("dr.limit.up"), up)),
+      h("span", { class: "sub" }, t("dr.limit.hint")),
+      chk(exempt, t("dr.unlimited")),
+      chk(vpn, t("dr.vpnbypass"))
+    ].filter(Boolean),
     onSubmit: async () => {
-      const body = { name: name.value.trim(), quota_mode: q.mode.value, limit_down_mbps: nn(down), limit_up_mbps: nn(up), exempt_quota: exempt.checked, vpn_bypass: vpn.checked };
+      const body = {
+        name: name.value.trim(),
+        quota_mode: q.mode.value,
+        limit_down_mbps: nn(down),
+        limit_up_mbps: nn(up),
+        exempt_quota: exempt.checked,
+        vpn_bypass: vpn.checked,
+      };
       if (q.mode.value === "fixed") body.fixed_gb = nn(q.gb);
-      await actions.createUser(body); toast(t("add.done")); await refresh(); return true;
-    } });
+      if (daily.value.trim() !== "") body.daily_limit_gb = nn(daily);
+      const selDevs = devChecks.map(lbl => lbl.querySelector("input")).filter(cb => cb && cb.checked).map(cb => +cb.value);
+      if (selDevs.length) body.device_ids = selDevs;
+      await actions.createUser(body);
+      toast(t("add.done"));
+      if (refresh) await refresh();
+      return true;
+    }
+  });
 }
 
 export function openAddDevice(users, refresh) {

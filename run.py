@@ -332,6 +332,11 @@ class Gateway:
         #: cfg.history.enabled. A dedicated thread tails dnsmasq's query log
         #: so file I/O never touches the event loop.
         self.dnslog: DnslogTailer | None = None
+        #: Home router client (Huawei HG630 / ZTE) for block sync and live stats
+        self.router_client: Any | None = None
+        self._last_router_pkt: dict[str, tuple[int, int]] = {}
+        self._router_active_macs: set[str] = set()
+        self._router_active_ips: set[str] = set()
         #: GitHub self-update manager (quota.updater): 24 h release checks, the
         #: Admin-tab update card, and the optional auto-install. Owned here so
         #: the maintenance tick drives the cadence and the app reads its state.
@@ -499,10 +504,43 @@ class Gateway:
                                             web_port=self.cfg.web.port)
         if self.arp_scanner is None:
             self.arp_scanner = ArpScanner(self.cfg)
+
+        router_cfg = getattr(self.cfg, "router", None)
+        db_router_ip = await self.database.get_setting("router_ip", "")
+        db_router_user = await self.database.get_setting("router_username", "")
+        db_router_pass = await self.database.get_setting("router_password", "")
+
+        eff_ip = db_router_ip or (router_cfg.ip if router_cfg else "192.168.1.1")
+        eff_user = db_router_user or (router_cfg.username if router_cfg else "admin")
+        eff_pass = db_router_pass or (router_cfg.password if router_cfg else "")
+
+        if (eff_pass or (router_cfg and router_cfg.enabled)) and self.router_client is None:
+            try:
+                from quota.router_client import HuaweiHG630Client
+                self.router_client = HuaweiHG630Client(
+                    ip=eff_ip,
+                    username=eff_user,
+                    password=eff_pass,
+                )
+                self.service.router_client = self.router_client
+                log.info("Router client configured for %s", eff_ip)
+            except Exception as e:
+                log.warning("Router client init notice: %s", e)
+
         self._install_signal_handlers()
 
     async def startup_subsystems(self) -> None:
         """Background initialization of kernel rules, shaping, firewall, tailers."""
+        # -- router client login (Huawei HG630 / ZTE) ----------------------
+        if self.router_client is not None:
+            try:
+                ok = await asyncio.to_thread(self.router_client.login)
+                log.info("Router login on startup: %s", ok)
+                if ok:
+                    await self._router_traffic_tick()
+            except Exception as e:
+                log.warning("Router login notice: %s", e)
+
         # -- startup self-heal (infrastructure resilience) -----------------
         try:
             await asyncio.to_thread(self._startup_self_heal)
@@ -1237,6 +1275,8 @@ class Gateway:
         used on their own (never the bare lease, which lags reality by up to
         ``LEASE_HOURS`` and kept away devices green)."""
         traffic = self._recent_traffic_ips()
+        if self.router_client is not None and getattr(self, "_router_active_ips", None):
+            return set(self._router_active_ips) | traffic
         probe_fresh = (
             self.latency_probe is not None and self._latency_sweep_ran
             and not (self._latency_interval > 0
@@ -1247,6 +1287,28 @@ class Gateway:
         if self._neigh_collected:
             return set(self._neigh_active_ips) | traffic
         return None
+
+    def _active_macs(self) -> Optional[set[str]]:
+        """Return currently active device MAC addresses learned from the router."""
+        if self.router_client is not None and getattr(self, "_router_active_macs", None) is not None:
+            return set(self._router_active_macs)
+        return None
+
+    async def update_router_client(self, ip: str, username: str, password: str) -> bool:
+        """Update router client live when user enters new credentials in UI."""
+        try:
+            from quota.router_client import HuaweiHG630Client
+            client = HuaweiHG630Client(ip=ip, username=username, password=password)
+            ok = await asyncio.to_thread(client.login)
+            if ok:
+                self.router_client = client
+                self.service.router_client = client
+                log.info("Gateway router_client updated live for %s", ip)
+                await self._router_traffic_tick()
+                return True
+        except Exception as e:
+            log.warning("Update router client error: %s", e)
+        return False
 
     async def _scan_rogues(self) -> None:
         """Probe the LAN for active hosts that are NOT known DHCP devices.
@@ -1518,6 +1580,10 @@ class Gateway:
                 except Exception:  # noqa: BLE001 - monitoring must never stall the tick
                     log.exception("LAN usage drain failed")
 
+        # 2b. Router client traffic accounting & lease sync (when configured)
+        if self.router_client is not None:
+            await self._timed("_router_traffic_tick", self._router_traffic_tick())
+
         # 3. Recompute block states from usage vs allowances.
         changes = await self.service.evaluate_blocks()
         for ch in changes:
@@ -1537,6 +1603,11 @@ class Gateway:
         ip_to_mac_all.update(self._tracked_ipv6({m.lower() for m in state}))
         self._last_ip_to_mac = ip_to_mac_all  # for an immediate shaping re-sync
         blocked = {mac: v["blocked"] for mac, v in state.items()}
+
+        # 4b. Reconcile block state with home router firewall (Parental Control)
+        if self.router_client is not None:
+            await self._timed("_router_block_sync", self._router_block_sync(blocked))
+
         pending_guests = {
             v["ip"] for mac, v in state.items()
             if v.get("ip") and v.get("guest") and v.get("blocked")
@@ -1642,6 +1713,89 @@ class Gateway:
                     "Network self-heal restored: " + ", ".join(fixed), "warn")
         except Exception:  # noqa: BLE001
             log.exception("network self-heal tick failed")
+
+    async def _router_traffic_tick(self) -> None:
+        """Sync connected devices from router and drain WLAN packet counters into usage_daily."""
+        if self.router_client is None:
+            return
+
+        # 1. Learn MAC<->IP bindings and register devices seen on the router
+        active_macs: set[str] = set()
+        active_ips: set[str] = set()
+        try:
+            r_devs = await asyncio.to_thread(self.router_client.list_connected_devices)
+            for rd in r_devs:
+                if rd.mac:
+                    mac_l = rd.mac.lower().replace("-", ":")
+                    if rd.online:
+                        active_macs.add(mac_l)
+                        if rd.ip:
+                            active_ips.add(rd.ip)
+                    if rd.ip and _LEASE_MAC_RE.match(rd.mac):
+                        await self._persist_lease(rd.mac, rd.ip)
+        except Exception as exc:
+            log.warning("Router connected devices sync warning: %s", exc)
+
+        # 2. WLAN packet counters for daily accounting
+        try:
+            diag = await asyncio.to_thread(self.router_client.get_wlan_diagnostics)
+            if diag:
+                for mac_w in diag.keys():
+                    active_macs.add(mac_w.lower().replace("-", ":"))
+            self._router_active_macs = active_macs
+            self._router_active_ips = active_ips
+            if not diag:
+                return
+
+            devices = await self.database.list_devices()
+            devices_by_mac = {d.mac.lower(): d for d in devices}
+            today = _dt.date.today().isoformat()
+            usage_records: list[tuple[int, str, int, int]] = []
+
+            for mac, stats in diag.items():
+                mac_l = mac.lower().replace("-", ":")
+                rx = stats.get("rx_pkt", 0)
+                tx = stats.get("tx_pkt", 0)
+
+                if mac_l in self._last_router_pkt:
+                    prev_rx, prev_tx = self._last_router_pkt[mac_l]
+                    delta_rx = rx - prev_rx if rx >= prev_rx else rx
+                    delta_tx = tx - prev_tx if tx >= prev_tx else tx
+
+                    # AP Rx = client upload, AP Tx = client download (~1050 bytes/pkt)
+                    up_bytes = int(delta_rx * 1050)
+                    down_bytes = int(delta_tx * 1050)
+
+                    dev = devices_by_mac.get(mac_l)
+                    if dev is not None and (up_bytes > 0 or down_bytes > 0):
+                        usage_records.append((dev.id, today, up_bytes, down_bytes))
+
+                self._last_router_pkt[mac_l] = (rx, tx)
+
+            if usage_records:
+                await self.database.add_usage_batch(usage_records)
+        except Exception as exc:
+            log.warning("Router traffic accounting warning: %s", exc)
+
+    async def _router_block_sync(self, blocked: dict[str, bool]) -> None:
+        """Reconcile database block states with the home router firewall / MAC filter."""
+        if self.router_client is None:
+            return
+        try:
+            active_blocked = await asyncio.to_thread(self.router_client.list_blocked_macs)
+            for mac, is_blocked in blocked.items():
+                mac_norm = mac.lower().replace("-", ":")
+                if mac_norm == GATEWAY_MAC.lower():
+                    continue
+
+                if is_blocked and mac_norm not in active_blocked:
+                    log.info("Router block sync: blocking %s", mac_norm)
+                    await asyncio.to_thread(self.router_client.block_device, mac_norm)
+                elif not is_blocked and mac_norm in active_blocked:
+                    log.info("Router block sync: unblocking %s", mac_norm)
+                    await asyncio.to_thread(self.router_client.unblock_device, mac_norm)
+        except Exception as exc:
+            log.warning("Router block sync warning: %s", exc)
 
     async def _sync_shaping(self, ip_to_mac: dict[str, str]) -> None:
         """Push the latest shaping settings + device caps into the tc shaper.
@@ -2494,6 +2648,8 @@ def main() -> None:
                          stop_new_sync=gateway._apply_stop_new_now,
                          decline_random_sync=gateway._apply_decline_random_now,
                          active_ips_getter=gateway._latency_active_ips,
+                         active_macs_getter=gateway._active_macs,
+                         gateway_ref=gateway,
                          tailscale_manager=TailscaleManager(
                              on_system_change=gateway._network_heal),
                          firewall=gateway.firewall,

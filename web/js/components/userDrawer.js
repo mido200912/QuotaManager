@@ -13,6 +13,8 @@ function settingsBlock(kind, o, run, withQuota) {
   const isUser = kind === "user";
   const num_ = (v) => h("input", { class: "input", type: "number", min: "0", step: "any", value: String(v || 0), inputmode: "decimal" });
   const down = num_(o.limit_down_mbps), up = num_(o.limit_up_mbps), dns = h("input", { class: "input ltr", value: o.dns_server || "", placeholder: "1.1.1.1", spellcheck: "false", "aria-label": t("dr.dns") });
+  const dailyVal = isUser ? ((o.devices && o.devices[0]?.daily_limit_gb) ?? o.daily_limit_gb) : o.daily_limit_gb;
+  const daily = h("input", { class: "input", type: "number", min: "0", step: "any", value: dailyVal != null ? String(dailyVal) : "", placeholder: "0 = " + t("dr.unlimited_daily"), inputmode: "decimal" });
   const mode = h("select", { class: "select" }, ["auto", "fixed"].map((m) => h("option", { value: m, selected: o.quota_mode === m }, t("dr.quota." + m))));
   const gb = h("input", { class: "input", type: "number", min: "0", step: "any", value: String(o.fixed_gb ?? 0) });
   const patch = isUser ? actions.patchUser : actions.patchDevice, dnsFn = isUser ? actions.dnsUser : actions.dnsDevice;
@@ -21,6 +23,9 @@ function settingsBlock(kind, o, run, withQuota) {
   const row = (title, sub, on, fn) => h("div", { class: "row-sw" }, h("div", {}, h("b", {}, title), h("span", {}, sub)), sw(on, title, fn));
   const save = run(async () => {
     const body = { limit_down_mbps: Math.max(0, +down.value || 0), limit_up_mbps: Math.max(0, +up.value || 0) };
+    if (daily) {
+      body.daily_limit_gb = daily.value.trim() !== "" ? Math.max(0, +daily.value || 0) : null;
+    }
     if (withQuota) { body.quota_mode = mode.value; if (mode.value === "fixed") body.fixed_gb = Math.max(0, +gb.value || 0); }
     await patch(o.id, body);
     if (dns.value.trim() !== (o.dns_server || "")) await dnsFn(o.id, dns.value.trim());
@@ -29,6 +34,10 @@ function settingsBlock(kind, o, run, withQuota) {
     h("h4", {}, t("dr.limits")),
     h("div", { class: "form-row" }, h("div", { class: "field" }, h("label", {}, t("dr.limit.down")), down), h("div", { class: "field" }, h("label", {}, t("dr.limit.up")), up)),
     h("span", { class: "sub" }, t("dr.limit.hint")),
+    daily ? [
+      h("h4", {}, t("dr.daily_limit")),
+      h("div", { class: "field" }, h("label", {}, t("dr.daily_limit")), daily, h("span", { class: "sub" }, t("dr.daily_limit.hint")))
+    ] : null,
     withQuota ? [h("h4", {}, t("dr.quota")), h("div", { class: "form-row" }, h("div", { class: "field" }, h("label", {}, t("dr.quota")), mode), h("div", { class: "field" }, h("label", {}, t("dr.quota.gb")), gb))] : null,
     row(t("dr.unlimited"), t("dr.unlimited.sub"), exempt, flag(isUser ? "exempt_quota" : "bypass", !exempt)),
     row(t("dr.vpnbypass"), t("dr.vpnbypass.sub"), o.vpn_bypass, flag("vpn_bypass", !o.vpn_bypass)),
@@ -42,6 +51,50 @@ function topupRow(id, isUser, run) {
   const go = run(async () => { const v = +gb.value; if (!(v > 0)) throw new Error(t("dr.topup.bad")); await (isUser ? actions.topupUser : actions.topupDevice)(id, v); gb.value = ""; }, t("dr.topup.done"));
   return h("div", { class: "field" }, h("label", {}, t("dr.topup")), h("div", { style: { display: "flex", gap: "10px" } }, h("div", { class: "grow" }, gb), h("button", { type: "button", class: "btn primary sm", style: { height: "40px" }, onclick: go }, icon("plus", 15), t("dr.topup.add"))), h("span", { class: "sub" }, t("dr.topup.hint")));
 }
+function groupDevicesSection(u, allUsers, run) {
+  const currentDevs = u.devices || [];
+  const otherDevs = allUsers.filter((x) => x.id !== u.id && !x.protected)
+    .flatMap((x) => (x.devices || []).map((d) => ({ ...d, ownerName: x.name })))
+    .filter((d) => !d.gateway);
+
+  const addSel = h("select", { class: "select" },
+    h("option", { value: "" }, "-- اختر جهازاً لإضافته لهذه المجموعة --"),
+    otherDevs.map((d) => h("option", { value: String(d.id) }, `${d.name || d.mac} (${d.ownerName})`))
+  );
+
+  const doAdd = run(async () => {
+    const devId = +addSel.value;
+    if (!devId) return;
+    await actions.patchDevice(devId, { user_id: u.id });
+    addSel.value = "";
+  }, t("dr.saved"));
+
+  const devRows = currentDevs.map((d) => {
+    const unlink = run(async () => {
+      await actions.patchDevice(d.id, { user_id: null });
+    }, t("dr.saved"));
+    return h("div", { class: "crow", style: { display: "flex", "justify-content": "space-between", "align-items": "center", padding: "6px 0", "border-bottom": "1px solid rgba(255,255,255,0.06)" } },
+      h("div", {},
+        h("b", { style: { "font-size": "13px" } }, d.name || d.mac),
+        h("span", { class: "sub mono", style: { "margin-right": "8px", "font-size": "11px" } }, d.ip || d.mac)),
+      currentDevs.length > 1 && !d.gateway ? h("button", { type: "button", class: "btn ghost sm", style: { "font-size": "11px", padding: "2px 8px" }, onclick: unlink }, "فصل جهاز") : null
+    );
+  });
+
+  return h("div", { class: "dr-sec" },
+    h("h4", {}, `أجهزة هذه المجموعة (${currentDevs.length})`),
+    h("span", { class: "sub", style: { "margin-bottom": "8px", display: "block" } }, "جميع الأجهزة هنا تشترك معاً في نفس الباقة الشهرية والحد اليومي"),
+    h("div", { style: { "margin-bottom": "12px" } }, devRows),
+    otherDevs.length ? h("div", { class: "field" },
+      h("label", {}, "ضم جهاز آخر للمجموعة"),
+      h("div", { style: { display: "flex", gap: "8px" } },
+        h("div", { class: "grow" }, addSel),
+        h("button", { type: "button", class: "btn primary sm", onclick: doAdd }, icon("plus", 14), "ضم")
+      )
+    ) : null
+  );
+}
+
 function userDetails(u, run) {
   const name = h("input", { class: "input", value: u.name || "", "aria-label": t("dr.name") });
   const hist = h("input", { class: "input", type: "number", min: "0", max: "365", step: "1", value: u.history_days == null ? "" : String(u.history_days), placeholder: t("dr.hist.ph"), inputmode: "numeric" });
@@ -131,6 +184,7 @@ export function openUserDrawer(userId, getDashboard, refresh) {
       body.push(h("div", { class: "fa" }, a));
     }
     body.push(settingsBlock("user", u, run, true));
+    if (!u.protected) body.push(groupDevicesSection(u, getDashboard()?.users || [], run));
     if (!u.protected) body.push(userDetails(u, run));
     if (!u.protected) body.push(h("div", { class: "dr-sec" }, h("h4", {}, t("dr.danger")),
       h("div", { class: "danger-z" },

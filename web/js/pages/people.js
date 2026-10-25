@@ -50,7 +50,7 @@ export default function people(ctx) {
         h("div", { class: "u-use" }, h("div", { class: "u-num" }, h("b", {}, `${num(u.used_gb)} ${t("common.gb")}`), h("span", {}, u.allowance_gb > 0 ? `${t("ov.of")} ${num(u.allowance_gb)}` : t("pp.unlimited")), u.allowance_gb > 0 ? h("em", {}, `${num(u.percent, 0)}%`) : null),
           bar(u.allowance_gb > 0 ? u.percent : 0), netLine(u.used_gb, u.lan_used_gb)),
         h("div", { class: "u-stat" }, chip(st.cls.replace("chip", "").trim(), st.text)),
-        sw(!u.blocked, t("pp.access"), act(() => actions.blockUser(u.id, !u.blocked)))),
+        u.protected ? h("span", {}) : sw(!u.blocked, t("pp.access"), act(() => actions.blockUser(u.id, !u.blocked)))),
       isOpen ? h("div", { class: "drows" }, devs.length ? devs.map((x) => {
         const lv = liveBy.get(x.id);
         return h("div", { class: "drow" },
@@ -69,7 +69,7 @@ export default function people(ctx) {
   fill();
   return h("div", { class: "page" },
     h("div", { class: "toolbar" }, h("label", { class: "search" }, icon("search", 18), input), seg,
-      h("button", { type: "button", class: "btn primary sm", onclick: () => openAddUser(ctx.refresh) }, icon("userplus", 15), t("add.user")),
+      h("button", { type: "button", class: "btn primary sm", onclick: () => openAddUser(all, ctx.refresh) }, icon("userplus", 15), t("add.user")),
       h("button", { type: "button", class: "btn sm", onclick: () => openAddDevice(all, ctx.refresh) }, icon("plus", 15), t("add.dev"))),
     h("section", { class: "card list-card" },
       h("div", { class: "lhead" }, h("span"), h("span", {}, t("pp.col.user")), h("span", {}, t("pp.col.usage")), h("span", {}, t("pp.col.status")), h("span", {}, t("pp.col.access"))),

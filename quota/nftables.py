@@ -403,6 +403,11 @@ class NftablesEngine:
         # Clamp TCP MSS to Path MTU on forwarded traffic (prevents VPN/PPPoE packet fragmentation)
         self._run_best_effort(["add", "rule", f"{FAMILY} {self.table} forward",
                                "tcp flags syn tcp option maxseg size set rt mtu"])
+        # Block DNS-over-TLS (port 853) to prevent clients from bypassing local dnsmasq filtering / ad-block
+        self._run_best_effort(["add", "rule", f"{FAMILY} {self.table} forward",
+                               "tcp dport 853 drop"])
+        self._run_best_effort(["add", "rule", f"{FAMILY} {self.table} forward",
+                               "meta nfproto ipv6 tcp dport 853 drop"])
         # The box's own internet: input/output hooks with q_gw_up/q_gw_down
         # counters (count_gateway) + a gw_blocked set the admin toggles. Runs
         # BEFORE the counter reset below so a carried-over q_gw_* total is

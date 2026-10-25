@@ -51,7 +51,8 @@ from api.schemas import (BundleUpdate, ConsumptionSpoofRequest, DeviceCreate,
                          UpdateSettings, UserCreate, UserUpdate,
                          VpnConnectRequest, VpnNodeCreate, VpnNodeUpdate,
                          VpnRoutingUpdateRequest, VpnSettingsUpdate,
-                         WanRenewConfig, WanTest, WanUpdate, TailscaleDisconnect)
+                         WanRenewConfig, WanTest, WanUpdate, TailscaleDisconnect,
+                         WifiSettingsUpdate)
 from api import waf as _waf
 from core import passwords as _passwords
 from core import timeutil
@@ -286,6 +287,8 @@ def create_app(
     wan_renew: Optional[Callable[[], object]] = None,
     shaping_state_getter: Optional[Callable[[], dict]] = None,
     active_ips_getter: Optional[Callable[[], Optional[set[str]]]] = None,
+    active_macs_getter: Optional[Callable[[], Optional[set[str]]]] = None,
+    gateway_ref: Optional[object] = None,
     stop_new_sync: Optional[Callable[[], object]] = None,
     decline_random_sync: Optional[Callable[[], object]] = None,
     firewall: object | None = None,
@@ -490,6 +493,7 @@ def create_app(
                      live: EngineSnapshot, state: str,
                      dusage: dict[str, int] | None = None,
                      active_ips: Optional[set[str]] = None,
+                     active_macs: Optional[set[str]] = None,
                      lan_usage: dict[str, int] | None = None,
                      ip6: str = "",
                      ipv6_direct: bool = False) -> dict[str, Any]:
@@ -529,9 +533,14 @@ def create_app(
             "connected": (
                 # the box itself is online whenever it answers this request
                 dev.mac == GATEWAY_MAC
-                or (dev.mac in leases
-                    and (active_ips is None
-                         or (leases.get(dev.mac) or "") in active_ips))),
+                or (
+                    (dev.mac.lower() in active_macs)
+                    if active_macs is not None
+                    else (dev.mac in leases
+                          and (active_ips is None
+                               or (leases.get(dev.mac) or "") in active_ips))
+                )
+            ),
             # owning user is a guest account (guest-mode auto-registration)
             "guest": bool(user.guest) if user else False,
             "quota_mode": uv["quota_mode"] if uv else dev.quota_mode,
@@ -546,6 +555,7 @@ def create_app(
             # per-device internet speed caps (Mbps, 0 = unlimited)
             "limit_down_mbps": float(dev.limit_down_mbps or 0.0),
             "limit_up_mbps": float(dev.limit_up_mbps or 0.0),
+            "daily_limit_gb": getattr(dev, "daily_limit_gb", None),
             # per-device upstream DNS-server override (empty = inherit)
             "dns_server": dev.dns_server or "",
             "allowance_gb": allowance,
@@ -605,6 +615,7 @@ def create_app(
         lan_by_device = await database.get_lan_period_usage()
         leases = {l.mac: l.ip for l in await database.list_leases()}
         active_ips = active_ips_getter() if active_ips_getter else None
+        active_macs = active_macs_getter() if active_macs_getter else None
         static_leases = await database.list_static_leases()
         static_ip6_map = {
             s["mac"].lower(): s["ip6"]
@@ -664,6 +675,7 @@ def create_app(
                 "blocked": admin_blocked or quota_blocked,
                 "block_state": state,
                 "quota_blocked": quota_blocked,
+                "daily_limit_gb": None,
                 "devices": [],
             }
 
@@ -689,12 +701,25 @@ def create_app(
                 d, user, uv, leases, live, state,
                 usage_by_device.get(d.id, {"up": 0, "down": 0}),
                 active_ips,
+                active_macs=active_macs,
                 ip6=dev_ip6,
                 ipv6_direct=dev_mac in direct_macs,
                 lan_usage=lan_by_device.get(d.id))
             devices_view.append(dev_view)
             if uv is not None:
                 uv["devices"].append(dev_view)
+
+        for uv in user_views.values():
+            if uv.get("protected"):
+                continue
+            u_devs = uv.get("devices", [])
+            if u_devs:
+                if any(dv.get("daily_limit_gb") is not None for dv in u_devs):
+                    uv["daily_limit_gb"] = next(dv["daily_limit_gb"] for dv in u_devs if dv.get("daily_limit_gb") is not None)
+                if all(dv.get("blocked") for dv in u_devs):
+                    uv["blocked"] = True
+                    if uv.get("block_state") == _db.BLOCK_OK:
+                        uv["block_state"] = u_devs[0].get("block_state", _db.BLOCK_ADMIN)
 
         # What the box's own block toggle resolves to (the protected Gateway
         # user's user-level view — the same resolve_device_state the tick uses).
@@ -2050,6 +2075,8 @@ def create_app(
             fields["limit_down_mbps"] = body.limit_down_mbps
         if body.limit_up_mbps is not None:
             fields["limit_up_mbps"] = body.limit_up_mbps
+        if body.daily_limit_gb is not None:
+            fields["daily_limit_gb"] = body.daily_limit_gb
         if fields:
             await database.update_device(device_id, **fields)
         # Quota lives on the USER now: a quota edit through a device card is
@@ -2064,6 +2091,15 @@ def create_app(
             await database.update_user(dev.user_id, **ufields)
         if body.block is not None:
             await service.set_admin_block(device_id, body.block)
+            r_client = getattr(service, "router_client", None)
+            if r_client is not None:
+                try:
+                    if body.block:
+                        await asyncio.to_thread(r_client.block_device, dev.mac)
+                    else:
+                        await asyncio.to_thread(r_client.unblock_device, dev.mac)
+                except Exception as _rexc:
+                    logging.getLogger("quota.router").warning("Router block sync error: %s", _rexc)
         await service.recompute_allowances()
         if body.user_id is not None and body.user_id != dev.user_id:
             await database.add_event(
@@ -2135,6 +2171,17 @@ def create_app(
             limit_up_mbps=body.limit_up_mbps or 0.0,
             exempt_quota=bool(body.exempt_quota or False),
             vpn_bypass=bool(body.vpn_bypass or False))
+        if body.device_ids:
+            for dev_id in body.device_ids:
+                dev = await database.get_device(dev_id)
+                if dev and dev.mac != GATEWAY_MAC:
+                    up_kwargs: dict[str, Any] = {"user_id": user.id}
+                    if body.daily_limit_gb is not None:
+                        up_kwargs["daily_limit_gb"] = body.daily_limit_gb
+                    await database.update_device(dev.id, **up_kwargs)
+                    await database.add_event(
+                        f"Device '{dev.name or dev.mac}' joined group '{user.name}'",
+                        "info", device_id=dev.id, user_id=user.id)
         await service.recompute_allowances()
         await database.add_event(
             f"User added: {body.name or 'unnamed'}", "info", user_id=user.id)
@@ -2157,8 +2204,51 @@ def create_app(
                 fields[key] = value
         if fields:
             await database.update_user(user_id, **fields)
+        if body.daily_limit_gb is not None:
+            user_devs = await database.list_devices(user_id=user_id)
+            for d in user_devs:
+                await database.update_device(d.id, daily_limit_gb=body.daily_limit_gb)
+        if body.device_ids is not None:
+            current_user_devs = await database.list_devices(user_id=user_id)
+            current_ids = {d.id for d in current_user_devs if d.mac != GATEWAY_MAC}
+            desired_ids = set(body.device_ids)
+
+            # Reassign newly added devices to this user
+            to_add = desired_ids - current_ids
+            for dev_id in to_add:
+                dev = await database.get_device(dev_id)
+                if dev and dev.mac != GATEWAY_MAC:
+                    up_kwargs = {"user_id": user_id}
+                    if body.daily_limit_gb is not None:
+                        up_kwargs["daily_limit_gb"] = body.daily_limit_gb
+                    await database.update_device(dev_id, **up_kwargs)
+                    await database.add_event(
+                        f"Device '{dev.name or dev.mac}' moved to group '{user.name}'",
+                        "info", device_id=dev_id, user_id=user_id)
+
+            # Reassign removed devices to individual users
+            to_remove = current_ids - desired_ids
+            for dev_id in to_remove:
+                dev = await database.get_device(dev_id)
+                if dev and dev.mac != GATEWAY_MAC:
+                    new_u = await database.create_user(name=dev.name or dev.mac, quota_mode="auto")
+                    await database.update_device(dev_id, user_id=new_u.id)
+                    await database.add_event(
+                        f"Device '{dev.name or dev.mac}' unlinked from group '{user.name}'",
+                        "info", device_id=dev_id, user_id=new_u.id)
         if body.block is not None:
             await service.set_admin_block_user(user_id, body.block)
+            r_client = getattr(service, "router_client", None)
+            if r_client is not None:
+                try:
+                    user_devs = await database.list_devices(user_id=user_id)
+                    for d in user_devs:
+                        if body.block:
+                            await asyncio.to_thread(r_client.block_device, d.mac)
+                        else:
+                            await asyncio.to_thread(r_client.unblock_device, d.mac)
+                except Exception as _rexc:
+                    logging.getLogger("quota.router").warning("Router user block sync error: %s", _rexc)
         await service.recompute_allowances()
         _schedule_shaping_sync()  # the user's aggregate cap lands in tc now
         # A VPN-bypass edit must re-program the policy-routing exclusions now.
@@ -3431,7 +3521,8 @@ def create_app(
         response.set_cookie(COOKIE_NAME, token, httponly=True,
                             samesite="lax", secure=_secure_cookies(),
                             max_age=SESSION_TTL_SEC)
-        return {"ok": True}
+        is_default = (await database.get_setting("admin_password_default", "0")) == "1"
+        return {"ok": True, "password_default": is_default}
 
     @app.post("/api/logout")
     async def logout(response: Response) -> dict[str, Any]:
@@ -3447,7 +3538,8 @@ def create_app(
         stored = await database.get_setting("session_token", "")
         if not token or not stored or not hmac.compare_digest(token, stored):
             return {"authenticated": False}
-        return {"authenticated": True}
+        is_default = (await database.get_setting("admin_password_default", "0")) == "1"
+        return {"authenticated": True, "password_default": is_default}
 
     @app.post("/api/password")
     async def change_password(request: Request, body: PasswordUpdate) -> dict[str, Any]:
@@ -3528,6 +3620,248 @@ def create_app(
         await database.set_setting("totp_pending", "0")
         await database.add_event("TOTP two-factor disabled", "warn")
         return {"ok": True}
+
+    # -- ISP Auto-Sync (WE, Vodafone, etc.) & Router Bridge -------------------
+
+    @app.get("/api/isp/config", dependencies=[Depends(_require_auth)])
+    async def get_isp_config() -> dict[str, Any]:
+        return {
+            "provider": await database.get_setting("isp_provider", "we"),
+            "landline": await database.get_setting("isp_landline", ""),
+            "last_sync": await database.get_setting("isp_last_sync", ""),
+            "remaining_gb": await database.get_setting("isp_remaining_gb", ""),
+        }
+
+    @app.post("/api/isp/config", dependencies=[Depends(_require_auth)])
+    async def set_isp_config(request: Request) -> dict[str, Any]:
+        data = await request.json()
+        if "provider" in data:
+            await database.set_setting("isp_provider", str(data["provider"]).strip())
+        if "landline" in data:
+            await database.set_setting("isp_landline", str(data["landline"]).strip())
+        if "password" in data and data["password"]:
+            await database.set_setting("isp_password", str(data["password"]))
+        return {"ok": True}
+
+    @app.post("/api/isp/sync", dependencies=[Depends(_require_auth)])
+    async def sync_isp_now() -> dict[str, Any]:
+        from quota.isp_sync import IspSyncManager
+        mgr = IspSyncManager(database)
+        status = await mgr.sync_now()
+        if status and status.success:
+            return {
+                "ok": True,
+                "total_gb": status.total_gb,
+                "remaining_gb": status.remaining_gb,
+                "used_gb": status.used_gb,
+                "renewal_date": status.renewal_date,
+            }
+        raise HTTPException(400, "ISP sync failed — check landline and password")
+
+    @app.get("/api/router/config", dependencies=[Depends(_require_auth)])
+    async def get_router_config() -> dict[str, Any]:
+        ip = await database.get_setting("router_ip", "")
+        username = await database.get_setting("router_username", "")
+        password = await database.get_setting("router_password", "")
+        return {
+            "ip": ip or "192.168.1.1",
+            "username": username or "admin",
+            "has_password": bool(password),
+            "password": password,
+        }
+
+    @app.post("/api/router/config", dependencies=[Depends(_require_auth)])
+    async def set_router_config(request: Request) -> dict[str, Any]:
+        data = await request.json()
+        ip = str(data.get("ip", "192.168.1.1")).strip()
+        username = str(data.get("username", "admin")).strip()
+        password = str(data.get("password", "")).strip()
+        if ip:
+            await database.set_setting("router_ip", ip)
+        if username:
+            await database.set_setting("router_username", username)
+        if password:
+            await database.set_setting("router_password", password)
+        if gateway_ref and hasattr(gateway_ref, "update_router_client") and password:
+            try:
+                await gateway_ref.update_router_client(ip, username, password)
+            except Exception as _uexc:
+                logging.getLogger("quota.router").warning("Update gateway router client error: %s", _uexc)
+        return {"ok": True}
+
+    @app.post("/api/router/scan", dependencies=[Depends(_require_auth)])
+    async def scan_router_devices(request: Request) -> dict[str, Any]:
+        import traceback
+        _rlog = logging.getLogger("quota.router")
+        # Make sure router logs appear in the server console
+        if not _rlog.handlers:
+            _rlog.setLevel(logging.DEBUG)
+            _ch = logging.StreamHandler()
+            _ch.setLevel(logging.DEBUG)
+            _ch.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+            _rlog.addHandler(_ch)
+        else:
+            _rlog.setLevel(logging.DEBUG)
+
+        data = await request.json()
+        router_ip = data.get("ip", "192.168.1.1")
+        username = data.get("username", "admin")
+        password = data.get("password", "")
+
+        _rlog.info("=== Router Scan START === ip=%s user=%s pass_len=%d", router_ip, username, len(password))
+
+        from quota.router_client import ZteRouterClient
+        debug_lines: list[str] = []
+        try:
+            client = ZteRouterClient(ip=router_ip, username=username, password=password)
+
+            # Attach a debug handler to capture log lines for the response
+            class _ListHandler(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    debug_lines.append(self.format(record))
+
+            lh = _ListHandler()
+            lh.setFormatter(logging.Formatter("%(message)s"))
+            _rlog.addHandler(lh)
+            try:
+                logged_in = await asyncio.to_thread(client.login)
+                _rlog.info("=== Login result: %s ===", logged_in)
+                devices = []
+                if logged_in:
+                    devices = await asyncio.to_thread(client.list_connected_devices)
+                    _rlog.info("=== Devices found: %d ===", len(devices))
+                    # Persist router credentials to database & update gateway live!
+                    await database.set_setting("router_ip", router_ip)
+                    await database.set_setting("router_username", username)
+                    if password:
+                        await database.set_setting("router_password", password)
+                    if gateway_ref and hasattr(gateway_ref, "update_router_client") and password:
+                        try:
+                            await gateway_ref.update_router_client(router_ip, username, password)
+                        except Exception as _uexc:
+                            _rlog.warning("Update gateway router client error: %s", _uexc)
+            finally:
+                _rlog.removeHandler(lh)
+
+            return {
+                "logged_in": logged_in,
+                "devices": [
+                    {
+                        "mac": d.mac,
+                        "ip": d.ip,
+                        "hostname": d.hostname,
+                        "interface": d.interface,
+                        "online": d.online,
+                        "rate": getattr(d, "rate", ""),
+                        "rssi": getattr(d, "rssi", ""),
+                    }
+                    for d in devices
+                ],
+                "debug": debug_lines,
+            }
+        except Exception as exc:  # noqa: BLE001
+            tb = traceback.format_exc()
+            _rlog.error("Router scan EXCEPTION: %s\n%s", exc, tb)
+            return {
+                "logged_in": False,
+                "devices": [],
+                "debug": debug_lines + [f"EXCEPTION: {exc}", tb],
+            }
+
+    @app.post("/api/router/import-devices", dependencies=[Depends(_require_auth)])
+    async def import_router_devices(request: Request) -> dict[str, Any]:
+        data = await request.json()
+        devices = data.get("devices", [])
+        only_active = bool(data.get("only_active", False))
+        imported = 0
+        for d in devices:
+            if only_active and not d.get("online"):
+                continue
+            mac = (d.get("mac") or "").strip().lower()
+            name = (d.get("hostname") or "").strip() or f"Device-{mac[-5:]}"
+            if not mac or mac == GATEWAY_MAC:
+                continue
+            try:
+                existing_user = await database._fetch_one(
+                    "SELECT id FROM users WHERE name=? AND name != 'Gateway'", (name,)
+                )
+                user_id = existing_user["id"] if existing_user else None
+                await database.upsert_device(mac, name, "shared", 0.0, user_id, name)
+                imported += 1
+            except Exception as e:
+                logging.getLogger("quota.router").warning("Error importing device %s: %s", mac, e)
+        await service.recompute_allowances()
+        _schedule_shaping_sync()
+        return {"imported": imported}
+
+    async def _get_active_router_client() -> Any:
+        r_client = getattr(service, "router_client", None)
+        if r_client is not None:
+            return r_client
+        r_ip = await database.get_setting("router_ip", "192.168.1.1")
+        r_user = await database.get_setting("router_username", "admin")
+        r_pass = await database.get_setting("router_password", "")
+        if not r_pass:
+            router_cfg = getattr(getattr(service, "config", None), "router", None)
+            if router_cfg:
+                r_ip = getattr(router_cfg, "ip", r_ip)
+                r_user = getattr(router_cfg, "username", r_user)
+                r_pass = getattr(router_cfg, "password", r_pass)
+        from quota.router_client import HuaweiHG630Client
+        client = HuaweiHG630Client(ip=r_ip, username=r_user, password=r_pass)
+        ok = await asyncio.to_thread(client.login)
+        if ok:
+            service.router_client = client
+            if gateway_ref:
+                gateway_ref.router_client = client
+            return client
+        return None
+
+    @app.get("/api/router/dsl", dependencies=[Depends(_require_auth)])
+    async def get_router_dsl_stats() -> dict[str, Any]:
+        client = await _get_active_router_client()
+        if not client:
+            raise HTTPException(503, "Router not connected or credentials not set")
+        return await asyncio.to_thread(client.get_dsl_info)
+
+    @app.get("/api/router/info", dependencies=[Depends(_require_auth)])
+    async def get_router_device_info() -> dict[str, Any]:
+        client = await _get_active_router_client()
+        if not client:
+            raise HTTPException(503, "Router not connected or credentials not set")
+        return await asyncio.to_thread(client.get_device_info)
+
+    @app.get("/api/router/wifi", dependencies=[Depends(_require_auth)])
+    async def get_router_wifi_settings() -> dict[str, Any]:
+        client = await _get_active_router_client()
+        if not client:
+            raise HTTPException(503, "Router not connected or credentials not set")
+        return await asyncio.to_thread(client.get_wifi_settings)
+
+    @app.post("/api/router/wifi", dependencies=[Depends(_require_auth)])
+    async def update_router_wifi_settings(body: WifiSettingsUpdate) -> dict[str, Any]:
+        client = await _get_active_router_client()
+        if not client:
+            raise HTTPException(503, "Router not connected or credentials not set")
+        ok = await asyncio.to_thread(
+            client.update_wifi_settings,
+            ssid=body.ssid,
+            password=body.password,
+            hidden=body.hidden,
+            max_clients=body.max_clients,
+            enabled=body.enabled,
+        )
+        if not ok:
+            raise HTTPException(500, "Failed to update router WiFi settings")
+        return {"updated": True}
+
+    @app.post("/api/router/reboot", dependencies=[Depends(_require_auth)])
+    async def reboot_router() -> dict[str, Any]:
+        client = await _get_active_router_client()
+        if not client:
+            raise HTTPException(503, "Router not connected or credentials not set")
+        ok = await asyncio.to_thread(client.reboot)
+        return {"rebooting": ok}
 
     # -- websocket ------------------------------------------------------------
 

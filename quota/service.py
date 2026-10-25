@@ -551,6 +551,8 @@ class QuotaService:
             return _db.BLOCK_ADMIN
         if dev.block_state == _db.BLOCK_ADMIN:
             return _db.BLOCK_ADMIN
+        if dev.block_state == _db.BLOCK_QUOTA:
+            return _db.BLOCK_QUOTA
         if allow_listed:
             return _db.BLOCK_OK
         if user_quota_blocked and not dev.bypass and not has_device_booster:
@@ -579,12 +581,8 @@ class QuotaService:
         return out
 
     async def evaluate_blocks(self) -> list[dict[str, Any]]:
-        """Recompute block states from per-USER usage vs per-USER allowance.
-
-        Only the QUOTA fan-out is persisted on devices (``block_state='quota'``)
-        — the user-level admin cut is resolved at render/enforcement time by
-        :meth:`resolve_device_state`, never written to devices. Returns a list
-        of persisted changes: ``{device_id, mac, state, changed}``.
+        """Recompute block states from per-USER usage vs per-USER allowance,
+        and per-DEVICE daily quota limits.
         """
         bundle = await self.db.get_bundle()
         allowances = bundle.allowances
@@ -606,23 +604,43 @@ class QuotaService:
             if user is None:
                 continue  # orphaned device (should not happen post-migration)
             if dev.mac == _db.GATEWAY_MAC:
-                # The box's own row: its cut is user-resolved at
-                # render/enforcement time, never persisted as 'quota' — a
-                # persisted flag would desync the Gateway card's toggle.
                 continue
             if dev.block_state == _db.BLOCK_ADMIN:
                 continue  # per-device manual override stays until lifted
             if user.block_state == _db.BLOCK_ADMIN:
                 continue  # user-level cut resolved at render time, not persisted
             has_booster = dev.id in device_booster_ids
-            new_state = (_db.BLOCK_QUOTA if (user_quota.get(dev.user_id, False) and not dev.bypass and not has_booster)
-                         else _db.BLOCK_OK)
+
+            # Check daily quota limit
+            daily_exceeded = False
+            import datetime as _dt
+            today = _dt.date.today().isoformat()
+            is_unblocked_today = (getattr(dev, "access_override", "") or "").startswith(f"unblock:{today}")
+            if (getattr(dev, "daily_limit_gb", None) is not None
+                    and dev.daily_limit_gb > 0
+                    and not dev.bypass
+                    and not is_unblocked_today):
+                today_bytes = await self.db.get_device_today_usage(dev.id, today=today)
+                if today_bytes >= dev.daily_limit_gb * (1024**3):
+                    daily_exceeded = True
+
+            user_blocked = user_quota.get(dev.user_id, False) and not dev.bypass and not has_booster
+            new_state = _db.BLOCK_QUOTA if (user_blocked or daily_exceeded) else _db.BLOCK_OK
             if new_state != dev.block_state:
+                prev_state = dev.block_state
                 await self.db.set_device_state(dev.id, new_state)
                 changes.append({
                     "device_id": dev.id, "mac": dev.mac,
                     "state": new_state, "changed": True,
                 })
+                if new_state == _db.BLOCK_QUOTA and daily_exceeded:
+                    await self.db.add_event(
+                        f"Daily limit reached ({dev.daily_limit_gb} GB) for '{dev.name or dev.mac}' - internet blocked for rest of day",
+                        "warn", dev.id)
+                elif new_state == _db.BLOCK_OK and prev_state == _db.BLOCK_QUOTA:
+                    await self.db.add_event(
+                        f"Daily limit reset for '{dev.name or dev.mac}' - internet restored",
+                        "info", dev.id)
         return changes
 
     async def snapshot_state(self) -> dict[str, dict[str, Any]]:
@@ -1281,24 +1299,41 @@ class QuotaService:
         dev = await self.db.get_device(device_id)
         if dev is None:
             return None
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
         state = _db.BLOCK_ADMIN if blocked else _db.BLOCK_OK
         await self.db.set_device_state(dev.id, state)
+        if blocked:
+            await self.db.update_device(dev.id, access_override="")
+        else:
+            await self.db.update_device(dev.id, access_override=f"unblock:{today}")
+            if dev.user_id is not None:
+                user = await self.db.get_user(dev.user_id)
+                if user is not None and user.block_state == _db.BLOCK_ADMIN:
+                    user_devs = await self.db.list_devices(user_id=dev.user_id)
+                    other_blocked = any(d.id != dev.id and d.block_state == _db.BLOCK_ADMIN for d in user_devs)
+                    if not other_blocked:
+                        await self.db.update_user(dev.user_id, block_state=_db.BLOCK_OK)
         await self.db.add_event(
             f"{'Blocked' if blocked else 'Unblocked'} '{dev.name}'", "warn", dev.id)
         return {"device_id": device_id, "mac": dev.mac, "block_state": state}
 
     async def set_admin_block_user(self, user_id: int, blocked: bool) -> Optional[dict[str, Any]]:
-        """Manually cut/uncut all of a user's devices at once.
-
-        The user-level ``admin_off`` is applied at render/enforcement time (see
-        :meth:`resolve_device_state`), so no device rows are touched — clearing
-        the cut restores every device immediately.
-        """
+        """Manually cut/uncut all of a user's devices at once."""
         user = await self.db.get_user(user_id)
         if user is None:
             return None
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
         state = _db.BLOCK_ADMIN if blocked else _db.BLOCK_OK
         await self.db.update_user(user_id, block_state=state)
+        user_devs = await self.db.list_devices(user_id=user_id)
+        for d in user_devs:
+            await self.db.set_device_state(d.id, state)
+            if blocked:
+                await self.db.update_device(d.id, access_override="")
+            else:
+                await self.db.update_device(d.id, access_override=f"unblock:{today}")
         await self.db.add_event(
             f"{'Blocked' if blocked else 'Unblocked'} user '{user.name}'",
             "warn", user_id=user_id)
